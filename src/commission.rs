@@ -15,7 +15,7 @@ const CMD_OPERATIONAL_CSRREQUEST: u32 = 0x4;
 
 const CLUSTER_GENERAL_COMMISSIONING: u32 = 0x30;
 const CMD_GENERAL_COMMISSIONING_ARMFAILSAFE: u32 = 0;
-//const CMD_GENERAL_COMMISSIONING_SETREGULATORYCONFIG: u32 = 2;
+const CMD_GENERAL_COMMISSIONING_SETREGULATORYCONFIG: u32 = 2;
 const CMD_GENERAL_COMMISSIONING_COMMISSIONINGCOMPLETE: u32 = 4;
 
 #[cfg(feature = "ble")]
@@ -325,13 +325,15 @@ async fn arm_failsafe(
     Ok(())
 }
 
-/*async fn set_regulatory_config(
+#[cfg(feature = "ble")]
+async fn set_regulatory_config(
     retrctx: &mut retransmit::RetrContext<'_>,
+    location: u8,
     exchange_id: u16,
 ) -> Result<()> {
     let mut tlv_buf = tlv::TlvBuffer::new();
-    tlv_buf.write_uint8(0, 0)?;  // location type: Indoor
-    tlv_buf.write_string(1, "XX")?; // regulatory location (placeholder)
+    tlv_buf.write_uint8(0, location)?;
+    tlv_buf.write_string(1, "XX")?; // country unknown, which the spec allows
     tlv_buf.write_uint64(2, 0)?;  // breadcrumb
     let req = messages::im_invoke_request(
         0,
@@ -348,7 +350,109 @@ async fn arm_failsafe(
         return Err(anyhow::anyhow!("SetRegulatoryConfig failed with status {}", status));
     }
     Ok(())
-}*/
+}
+
+/// What a device says about being commissioned, read before its network step. Each is `None`
+/// when the device doesn't answer.
+#[cfg(feature = "ble")]
+#[derive(Debug, Default)]
+struct CommissioningInfo {
+    /// General Commissioning BasicCommissioningInfo.MaxCumulativeFailsafeSeconds.
+    max_cumulative_failsafe_secs: Option<u16>,
+    /// General Commissioning LocationCapability: 0 indoor, 1 outdoor, 2 both.
+    location_capability: Option<u8>,
+    /// General Commissioning SupportsConcurrentConnection: whether the device keeps the
+    /// commissioning channel (Bluetooth) up while it joins the network.
+    concurrent_connection: Option<bool>,
+    /// Network Commissioning ConnectMaxTimeSeconds: how long joining the network can take.
+    connect_max_secs: Option<u8>,
+}
+
+#[cfg(feature = "ble")]
+impl CommissioningInfo {
+    /// The fail-safe to arm before ConnectNetwork: long enough to join the network, then be found
+    /// over operational mDNS and finish over IP. The device caps it at its cumulative maximum.
+    fn network_failsafe_secs(&self) -> u16 {
+        u16::from(self.connect_max_secs.unwrap_or(60)) + 120
+    }
+
+    /// How long to wait for ConnectNetworkResponse, or `None` when the device won't send one over
+    /// the commissioning channel because it drops that channel to join the network.
+    fn connect_response_wait(&self) -> Option<std::time::Duration> {
+        if self.concurrent_connection == Some(false) {
+            return None;
+        }
+        Some(std::time::Duration::from_secs(u64::from(self.connect_max_secs.unwrap_or(60)) + 30))
+    }
+
+    /// The location for SetRegulatoryConfig: the device's own, or indoor and outdoor when it can be both.
+    fn regulatory_location(&self) -> u8 {
+        match self.location_capability {
+            Some(location @ 0..=1) => location,
+            _ => 2,
+        }
+    }
+}
+
+/// Reads one attribute from endpoint 0 and returns the ReportData message.
+#[cfg(feature = "ble")]
+async fn read_attribute(
+    retrctx: &mut retransmit::RetrContext<'_>,
+    cluster: u32,
+    attr: u32,
+    exchange_id: u16,
+) -> Result<messages::Message> {
+    let req = messages::im_read_request(0, cluster, attr, exchange_id)?;
+    retrctx.send(&req).await?;
+    let resp = retrctx.get_next_message().await?;
+    if resp.protocol_header.opcode != messages::ProtocolMessageHeader::INTERACTION_OPCODE_REPORT_DATA {
+        anyhow::bail!("reading 0x{:04x}/0x{:04x} answered with opcode 0x{:02x}", cluster, attr, resp.protocol_header.opcode);
+    }
+    Ok(resp)
+}
+
+/// Reads what the device says about being commissioned. A device that doesn't answer one of these
+/// still gets commissioned, with the defaults.
+#[cfg(feature = "ble")]
+async fn read_commissioning_info(retrctx: &mut retransmit::RetrContext<'_>, exchange_id: u16) -> CommissioningInfo {
+    const ATTR_BASIC_COMMISSIONING_INFO: u32 = 0x0001;
+    const ATTR_LOCATION_CAPABILITY: u32 = 0x0003;
+    const ATTR_SUPPORTS_CONCURRENT_CONNECTION: u32 = 0x0004;
+    const ATTR_CONNECT_MAX_TIME_SECONDS: u32 = 0x0003;
+    const VALUE: [u8; 4] = [1, 0, 1, 2];
+    let mut info = CommissioningInfo::default();
+    let reads = [
+        (CLUSTER_GENERAL_COMMISSIONING, ATTR_BASIC_COMMISSIONING_INFO),
+        (CLUSTER_GENERAL_COMMISSIONING, ATTR_LOCATION_CAPABILITY),
+        (CLUSTER_GENERAL_COMMISSIONING, ATTR_SUPPORTS_CONCURRENT_CONNECTION),
+        (CLUSTER_NETWORK_COMMISSIONING, ATTR_CONNECT_MAX_TIME_SECONDS),
+    ];
+    for (i, (cluster, attr)) in reads.into_iter().enumerate() {
+        let resp = match read_attribute(retrctx, cluster, attr, exchange_id.wrapping_add(i as u16)).await {
+            Ok(resp) => resp,
+            Err(e) => {
+                log::debug!("reading 0x{:04x}/0x{:04x} failed: {:?}", cluster, attr, e);
+                continue;
+            }
+        };
+        match (cluster, attr) {
+            (CLUSTER_GENERAL_COMMISSIONING, ATTR_BASIC_COMMISSIONING_INFO) => {
+                info.max_cumulative_failsafe_secs = resp.tlv.get_u16(&[1, 0, 1, 2, 1]);
+            }
+            (CLUSTER_GENERAL_COMMISSIONING, ATTR_LOCATION_CAPABILITY) => {
+                info.location_capability = resp.tlv.get_u8(&VALUE);
+            }
+            (CLUSTER_GENERAL_COMMISSIONING, ATTR_SUPPORTS_CONCURRENT_CONNECTION) => {
+                if let Some(tlv::TlvItemValue::Bool(b)) = resp.tlv.get(&VALUE) {
+                    info.concurrent_connection = Some(*b);
+                }
+            }
+            _ => info.connect_max_secs = resp.tlv.get_u8(&VALUE),
+        }
+    }
+    info
+}
+
 
 #[cfg(feature = "ble")]
 async fn add_or_update_wifi(
@@ -424,11 +528,33 @@ async fn add_or_update_thread(
     Ok(ext_pan_id)
 }
 
+/// NetworkingStatusEnum names, for errors.
+#[cfg(feature = "ble")]
+fn networking_status(status: u64) -> &'static str {
+    match status {
+        1 => "OutOfRange",
+        2 => "BoundsExceeded",
+        3 => "NetworkIDNotFound",
+        4 => "DuplicateNetworkID",
+        5 => "NetworkNotFound",
+        6 => "RegulatoryError",
+        7 => "AuthFailure",
+        8 => "UnsupportedSecurity",
+        9 => "OtherConnectionFailure",
+        10 => "IPV6Failed",
+        11 => "IPBindFailed",
+        _ => "UnknownError",
+    }
+}
+
+/// Sends ConnectNetwork. Waits up to `wait` for the response; with no wait, or none arriving, the
+/// device is looked for on the network next, where it shows up once it has joined.
 #[cfg(feature = "ble")]
 async fn connect_network(
     retrctx: &mut retransmit::RetrContext<'_>,
     network_id: &[u8],
     exchange_id: u16,
+    wait: Option<std::time::Duration>,
 ) -> Result<()> {
     let mut tlv_buf = tlv::TlvBuffer::new();
     tlv_buf.write_octetstring(0, network_id)?;
@@ -442,10 +568,24 @@ async fn connect_network(
         false,
     )?;
     retrctx.send(&req).await?;
-    let resp = retrctx.get_next_message().await?;
+    let Some(wait) = wait else {
+        log::info!("Not waiting for ConnectNetworkResponse: the device drops Bluetooth to join the network");
+        return Ok(());
+    };
+    let resp = match tokio::time::timeout(wait, retrctx.get_next_message()).await {
+        Ok(Ok(resp)) => resp,
+        Ok(Err(e)) => {
+            log::warn!("No ConnectNetworkResponse ({:#}); looking for the device on the network anyway", e);
+            return Ok(());
+        }
+        Err(_) => {
+            log::warn!("No ConnectNetworkResponse in {}s; looking for the device on the network anyway", wait.as_secs());
+            return Ok(());
+        }
+    };
     let status = resp.tlv.get_int(&[1, 0, 0, 1, 0]).context("ConnectNetwork: status missing")?;
     if status != 0 {
-        return Err(anyhow::anyhow!("ConnectNetwork failed with status {}", status));
+        return Err(anyhow::anyhow!("ConnectNetwork failed: {} ({})", networking_status(status), status));
     }
     Ok(())
 }
@@ -463,7 +603,7 @@ pub(crate) async fn commission_ble_phase(
     let mut retrctx = retransmit::RetrContext::new(ble_connection, pase_session);
     let base: u16 = rand::random();
     let e_arm      = base;
-    //let e_reg      = base.wrapping_add(1);
+    let e_reg      = base.wrapping_add(1);
     // run_attestation uses e_attest+0, e_attest+1, e_attest+2 (3 exchanges)
     //let e_attest   = base.wrapping_add(2);
     let e_csr      = base.wrapping_add(5);
@@ -471,12 +611,19 @@ pub(crate) async fn commission_ble_phase(
     let e_noc      = base.wrapping_add(7);
     let e_net1     = base.wrapping_add(8);
     let e_net2     = base.wrapping_add(9);
+    let e_arm2     = base.wrapping_add(10);
+    let e_info     = base.wrapping_add(11); // four reads: 11..=14
 
     arm_failsafe(&mut retrctx, 60, e_arm).await.context("ArmFailSafe")?;
     log::debug!("Failsafe armed for 60 seconds");
 
-    //set_regulatory_config(&mut retrctx, e_reg).await.context("SetRegulatoryConfig")?;
-    //log::debug!("Regulatory configuration set");
+    let info = read_commissioning_info(&mut retrctx, e_info).await;
+    log::info!("Commissionee: {:?}", info);
+    // matc paired devices without this before; one that turns it down still gets commissioned.
+    match set_regulatory_config(&mut retrctx, info.regulatory_location(), e_reg).await {
+        Ok(()) => log::debug!("Regulatory configuration set"),
+        Err(e) => log::warn!("SetRegulatoryConfig: {:#}", e),
+    }
 
     //run_attestation(&mut retrctx, e_attest).await.context("Attestation")?;
     //log::debug!("Attestation completed");
@@ -491,20 +638,32 @@ pub(crate) async fn commission_ble_phase(
     match network_creds {
         NetworkCreds::WiFi { ssid, creds } => {
             let net_id = add_or_update_wifi(&mut retrctx, ssid, creds, e_net1).await?;
-            connect_network(&mut retrctx, &net_id, e_net2).await?;
+            rearm_for_network(&mut retrctx, &info, e_arm2).await?;
+            connect_network(&mut retrctx, &net_id, e_net2, info.connect_response_wait()).await?;
             log::debug!("WiFi network connected");
             // Give the device time to join the network before the caller probes mDNS.
             //tokio::time::sleep(std::time::Duration::from_secs(5)).await;
         }
         NetworkCreds::Thread { dataset } => {
             let net_id = add_or_update_thread(&mut retrctx, dataset, e_net1).await?;
-            connect_network(&mut retrctx, &net_id, e_net2).await?;
+            rearm_for_network(&mut retrctx, &info, e_arm2).await?;
+            connect_network(&mut retrctx, &net_id, e_net2, info.connect_response_wait()).await?;
             log::debug!("Thread network connected");
             //tokio::time::sleep(std::time::Duration::from_secs(5)).await;
         }
         NetworkCreds::AlreadyOnNetwork => {}
     }
 
+    Ok(())
+}
+
+/// Re-arms the fail-safe so it outlasts joining the network and finishing over IP; the first 60
+/// seconds can run out before a slow device has joined.
+#[cfg(feature = "ble")]
+async fn rearm_for_network(retrctx: &mut retransmit::RetrContext<'_>, info: &CommissioningInfo, exchange_id: u16) -> Result<()> {
+    let secs = info.network_failsafe_secs();
+    arm_failsafe(retrctx, secs, exchange_id).await.context("re-arming the fail-safe for the network step")?;
+    log::debug!("Failsafe re-armed for {} seconds", secs);
     Ok(())
 }
 
@@ -517,4 +676,43 @@ pub(crate) async fn commissioning_complete_udp(
     fabric: &Fabric,
 ) -> Result<session::Session> {
     commissioning_complete(udp_connection, cm, node_id, controller_id, fabric).await
+}
+
+#[cfg(all(test, feature = "ble"))]
+mod network_step_tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn test_waits_and_failsafe_follow_the_device() {
+        // A device that drops Bluetooth to join gets no wait; the fail-safe still covers joining.
+        let drops = CommissioningInfo { concurrent_connection: Some(false), connect_max_secs: Some(90), ..Default::default() };
+        assert_eq!(drops.connect_response_wait(), None);
+        assert_eq!(drops.network_failsafe_secs(), 210);
+
+        let keeps = CommissioningInfo { concurrent_connection: Some(true), connect_max_secs: Some(20), ..Default::default() };
+        assert_eq!(keeps.connect_response_wait(), Some(Duration::from_secs(50)));
+        assert_eq!(keeps.network_failsafe_secs(), 140);
+
+        // A device that answers none of the reads gets the spec's defaults.
+        let silent = CommissioningInfo::default();
+        assert_eq!(silent.connect_response_wait(), Some(Duration::from_secs(90)));
+        assert_eq!(silent.network_failsafe_secs(), 180);
+    }
+
+    #[test]
+    fn test_regulatory_location() {
+        let at = |location| CommissioningInfo { location_capability: location, ..Default::default() }.regulatory_location();
+        assert_eq!(at(Some(0)), 0);
+        assert_eq!(at(Some(1)), 1);
+        assert_eq!(at(Some(2)), 2);
+        assert_eq!(at(None), 2);
+    }
+
+    #[test]
+    fn test_networking_status_names() {
+        assert_eq!(networking_status(5), "NetworkNotFound");
+        assert_eq!(networking_status(7), "AuthFailure");
+        assert_eq!(networking_status(200), "UnknownError");
+    }
 }
