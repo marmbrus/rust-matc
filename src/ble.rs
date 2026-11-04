@@ -244,7 +244,7 @@ pub async fn connect_peripheral(peripheral: Peripheral) -> Result<BlePeripheral>
         write_c1: write_tx,
         read_c2: read_rx,
         att_mtu,
-        c2_abort,
+        c2_abort: Some(c2_abort),
         disconnect,
     })
 }

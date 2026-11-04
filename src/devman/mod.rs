@@ -298,12 +298,7 @@ impl DeviceManager {
         name: &str,
         network_creds: crate::commission::NetworkCreds,
     ) -> Result<controller::Connection> {
-        let info = if pairing_code.starts_with("MT:") || pairing_code.starts_with("mt:") {
-            crate::onboarding::decode_qr_payload(pairing_code)
-        } else {
-            crate::onboarding::decode_manual_pairing_code(pairing_code)
-        }
-        .context("decoding pairing code")?;
+        let info = decode_pairing_code(pairing_code)?;
 
         let connection = self
             .controller
@@ -318,6 +313,44 @@ impl DeviceManager {
             )
             .await?;
 
+        self.add_ble_commissioned(node_id, name)?;
+        Ok(connection)
+    }
+
+    /// Commission a device over a BLE link the caller already has, such as a phone relaying it
+    /// (see [`crate::btp::BlePeripheral::new`]), as [`Self::commission_ble_with_code`] does once
+    /// it has found the device. The caller found it by the code's discriminator.
+    ///
+    /// Requires the `ble` Cargo feature.
+    #[cfg(feature = "ble")]
+    pub async fn commission_ble_peripheral_with_code(
+        &self,
+        peripheral: crate::btp::BlePeripheral,
+        pairing_code: &str,
+        node_id: u64,
+        name: &str,
+        network_creds: crate::commission::NetworkCreds,
+    ) -> Result<controller::Connection> {
+        let info = decode_pairing_code(pairing_code)?;
+
+        let connection = self
+            .controller
+            .commission_ble_peripheral(
+                peripheral,
+                info.passcode,
+                node_id,
+                self.config.controller_id,
+                network_creds,
+                &self.mdns,
+            )
+            .await?;
+
+        self.add_ble_commissioned(node_id, name)?;
+        Ok(connection)
+    }
+
+    #[cfg(feature = "ble")]
+    fn add_ble_commissioned(&self, node_id: u64, name: &str) -> Result<()> {
         let device = crate::devman::Device {
             node_id,
             address: String::new(), // will be filled on first connect
@@ -327,8 +360,7 @@ impl DeviceManager {
             .lock()
             .map_err(|e| anyhow::anyhow!("registry lock: {}", e))?
             .add(device)?;
-
-        Ok(connection)
+        Ok(())
     }
 
     /// Discover the current address of a commissioned device via operational mDNS.
@@ -444,4 +476,15 @@ impl DeviceManager {
     pub fn base_path(&self) -> &str {
         &self.base_path
     }
+}
+
+/// Reads a manual pairing code (`"0251-520-0076"`) or a QR payload (`"MT:..."`).
+#[cfg(feature = "ble")]
+fn decode_pairing_code(pairing_code: &str) -> Result<onboarding::OnboardingInfo> {
+    if pairing_code.starts_with("MT:") || pairing_code.starts_with("mt:") {
+        onboarding::decode_qr_payload(pairing_code)
+    } else {
+        onboarding::decode_manual_pairing_code(pairing_code)
+    }
+    .context("decoding pairing code")
 }

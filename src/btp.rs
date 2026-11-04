@@ -28,8 +28,30 @@ pub struct BlePeripheral {
     pub write_c1: mpsc::Sender<Vec<u8>>,
     pub read_c2: mpsc::Receiver<Vec<u8>>,
     pub att_mtu: usize,
-    pub(crate) c2_abort: tokio::task::AbortHandle,
+    pub(crate) c2_abort: Option<tokio::task::AbortHandle>,
     pub(crate) disconnect: Box<dyn FnOnce() + Send>,
+}
+
+impl BlePeripheral {
+    /// A device's GATT link reached some other way than this crate's own BLE scan, such as through
+    /// a phone that relays it. Each item sent on `write_c1` is one write with response to C1, in
+    /// order; `read_c2` carries the device's C2 indications, in order. The other end subscribes to
+    /// C2 after the first C1 write (the BTP handshake request), as [`crate::ble`] does. `att_mtu`
+    /// is the negotiated ATT MTU, and `disconnect` runs once the BTP connection is dropped.
+    pub fn new(
+        write_c1: mpsc::Sender<Vec<u8>>,
+        read_c2: mpsc::Receiver<Vec<u8>>,
+        att_mtu: usize,
+        disconnect: impl FnOnce() + Send + 'static,
+    ) -> Self {
+        Self {
+            write_c1,
+            read_c2,
+            att_mtu,
+            c2_abort: None,
+            disconnect: Box::new(disconnect),
+        }
+    }
 }
 
 
@@ -37,13 +59,15 @@ pub struct BtpConnection {
     incoming: Mutex<mpsc::Receiver<Vec<u8>>>,
     outgoing: mpsc::Sender<Vec<BtpSegment>>,
     mtu_payload: usize,
-    c2_abort: tokio::task::AbortHandle,
+    c2_abort: Option<tokio::task::AbortHandle>,
     disconnect: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 impl Drop for BtpConnection {
     fn drop(&mut self) {
-        self.c2_abort.abort();
+        if let Some(c2_abort) = &self.c2_abort {
+            c2_abort.abort();
+        }
         if let Some(f) = self.disconnect.lock().unwrap().take() {
             f();
         }

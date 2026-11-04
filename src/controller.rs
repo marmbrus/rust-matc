@@ -299,13 +299,34 @@ impl Controller {
         network_creds: commission::NetworkCreds,
         mdns: &std::sync::Arc<crate::mdns2::MdnsService>,
     ) -> Result<Connection> {
-        use crate::btp::BtpConnection;
-
-        // 1. BLE scan + GATT connect + BTP handshake
+        // 1. BLE scan + GATT connect
         let peripheral = crate::ble::find_by_discriminator(discriminator, short_discriminator, std::time::Duration::from_secs(30))
             .await
             .context("BLE scan")?;
         log::debug!("BLE device found: z2");
+        self.commission_ble_peripheral(peripheral, pin, node_id, controller_id, network_creds, mdns)
+            .await
+    }
+
+    /// Commission a device over a BLE link the caller already has, as [`Self::commission_ble`]
+    /// does once it has found the device: the BTP handshake, then steps 2 to 9 there. For a link
+    /// that isn't this machine's own Bluetooth, such as a phone relaying it (see
+    /// [`crate::btp::BlePeripheral::new`]).
+    ///
+    /// Requires the `ble` Cargo feature.
+    #[cfg(feature = "ble")]
+    pub async fn commission_ble_peripheral(
+        &self,
+        peripheral: crate::btp::BlePeripheral,
+        pin: u32,
+        node_id: u64,
+        controller_id: u64,
+        network_creds: commission::NetworkCreds,
+        mdns: &std::sync::Arc<crate::mdns2::MdnsService>,
+    ) -> Result<Connection> {
+        use crate::btp::BtpConnection;
+
+        // 1. BTP handshake
         let btp_conn = BtpConnection::connect(peripheral).await.context("BTP connect")?;
 
         // 2. PASE
