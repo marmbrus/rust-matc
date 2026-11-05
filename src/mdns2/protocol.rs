@@ -17,6 +17,13 @@ use crate::mdns;
 pub(super) const MDNS_ADDR_V4: &str = "224.0.0.251:5353";
 pub(super) const MDNS_ADDR_V6: &str = "[ff02::fb]:5353";
 
+/// The top bit of a record's class in a response: the record is the whole set for its name and
+/// type (RFC 6762 10.2).
+const CACHE_FLUSH: u16 = 0x8000;
+/// How long records with the cache-flush bit set may still arrive in the same burst as the one
+/// that flushes, and so are kept beside it (RFC 6762 10.2).
+const CACHE_FLUSH_GRACE: Duration = Duration::from_secs(1);
+
 #[derive(Debug, Clone)]
 pub struct CachedRecord {
     pub rr: mdns::RR,
@@ -43,7 +50,10 @@ impl RecordCache {
     }
 
     /// Insert or update records from a DNS response.
-    /// TTL=0 removes the specific record whose rdata matches (RFC 6762 10.1).
+    /// TTL=0 removes the specific record whose rdata matches (RFC 6762 10.1). A record with the
+    /// cache-flush bit set replaces the others of its name and type received more than a second
+    /// before it (RFC 6762 10.2), such as the address a Thread device had behind a border router
+    /// that went away without saying goodbye.
     pub fn ingest(&mut self, rr: &mdns::RR) -> bool {
         let key = (rr.name.to_lowercase(), rr.typ);
         if rr.ttl == 0 {
@@ -61,6 +71,9 @@ impl RecordCache {
             ttl: Duration::from_secs(rr.ttl as u64),
         };
         let vec = self.entries.entry(key).or_default();
+        if rr.class & CACHE_FLUSH != 0 {
+            vec.retain(|c| c.rr.rdata == rr.rdata || c.received_at.elapsed() <= CACHE_FLUSH_GRACE);
+        }
         // Replace if same rdata, otherwise add
         if let Some(existing) = vec.iter_mut().find(|c| c.rr.rdata == rr.rdata) {
             *existing = cached;
@@ -263,3 +276,77 @@ pub(super) async fn send_loop(
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::Ipv6Addr;
+
+    fn aaaa(address: &str, class: u16) -> mdns::RR {
+        let ip: Ipv6Addr = address.parse().unwrap();
+        mdns::RR {
+            name: "host.local".to_string(),
+            typ: mdns::TYPE_AAAA,
+            class,
+            ttl: 7200,
+            rdata: ip.octets().to_vec(),
+            target: None,
+            data: mdns::RRData::AAAA(ip),
+        }
+    }
+
+    fn addresses(cache: &RecordCache) -> Vec<Ipv6Addr> {
+        cache
+            .lookup("host.local", mdns::TYPE_AAAA)
+            .into_iter()
+            .filter_map(|rr| match rr.data {
+                mdns::RRData::AAAA(ip) => Some(ip),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Ages every cached record, as if received this long ago.
+    fn age(cache: &mut RecordCache, by: Duration) {
+        for records in cache.entries.values_mut() {
+            for c in records {
+                c.received_at = Instant::now().checked_sub(by).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn test_cache_flush_replaces_older_records() {
+        let mut cache = RecordCache::new();
+        cache.ingest(&aaaa("fd1a::1", CACHE_FLUSH | 1));
+        age(&mut cache, Duration::from_secs(5));
+        cache.ingest(&aaaa("fd58::1", CACHE_FLUSH | 1));
+        assert_eq!(addresses(&cache), vec!["fd58::1".parse::<Ipv6Addr>().unwrap()]);
+    }
+
+    #[test]
+    fn test_cache_flush_keeps_records_from_the_same_burst() {
+        let mut cache = RecordCache::new();
+        cache.ingest(&aaaa("fd58::1", CACHE_FLUSH | 1));
+        cache.ingest(&aaaa("fd58::2", CACHE_FLUSH | 1));
+        assert_eq!(addresses(&cache).len(), 2);
+    }
+
+    #[test]
+    fn test_shared_records_accumulate() {
+        let mut cache = RecordCache::new();
+        cache.ingest(&aaaa("fd1a::1", 1));
+        age(&mut cache, Duration::from_secs(5));
+        cache.ingest(&aaaa("fd58::1", 1));
+        assert_eq!(addresses(&cache).len(), 2);
+    }
+
+    #[test]
+    fn test_cache_flush_refreshes_the_same_record() {
+        let mut cache = RecordCache::new();
+        cache.ingest(&aaaa("fd58::1", CACHE_FLUSH | 1));
+        age(&mut cache, Duration::from_secs(5));
+        cache.ingest(&aaaa("fd58::1", CACHE_FLUSH | 1));
+        assert_eq!(addresses(&cache).len(), 1);
+        assert!(cache.entries.values().flatten().all(|c| c.received_at.elapsed() < Duration::from_secs(1)));
+    }
+}
