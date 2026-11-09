@@ -37,6 +37,126 @@ pub enum NetworkCreds {
     /// Device is already on the IP network (Ethernet or pre-provisioned); skip
     /// NetworkCommissioning cluster writes.
     AlreadyOnNetwork,
+    /// Whichever of these fits the device, for a device whose kind of network isn't known
+    /// beforehand: its Network Commissioning cluster says whether it joins Wi-Fi or Thread (or is
+    /// on Ethernet, and needs none), which is read before the device is given anything.
+    Any(Vec<NetworkCreds>),
+}
+
+/// The kind of network interface a device's Network Commissioning cluster on endpoint 0 is for,
+/// from its feature map.
+#[cfg(feature = "ble")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NetworkInterface {
+    WiFi,
+    Thread,
+    Ethernet,
+}
+
+#[cfg(feature = "ble")]
+impl NetworkInterface {
+    /// The interface a feature map says, or `None` when it doesn't say exactly one: each instance
+    /// of the cluster is for one interface.
+    fn from_feature_map(features: u64) -> Option<Self> {
+        match features & 0b111 {
+            0b001 => Some(Self::WiFi),
+            0b010 => Some(Self::Thread),
+            0b100 => Some(Self::Ethernet),
+            _ => None,
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::WiFi => "Wi-Fi",
+            Self::Thread => "Thread",
+            Self::Ethernet => "Ethernet",
+        }
+    }
+
+    /// The interface `creds` are for, if they're for one.
+    fn of(creds: &NetworkCreds) -> Option<Self> {
+        match creds {
+            NetworkCreds::WiFi { .. } => Some(Self::WiFi),
+            NetworkCreds::Thread { .. } => Some(Self::Thread),
+            NetworkCreds::AlreadyOnNetwork | NetworkCreds::Any(_) => None,
+        }
+    }
+}
+
+/// The credentials to give a device whose Network Commissioning cluster is for `interface`
+/// (`None` when reading it failed): one of `offered`'s, which can't be [`NetworkCreds::Any`].
+/// Fails when none fit, before anything has been sent to the device but reads.
+#[cfg(feature = "ble")]
+fn credentials_for(offered: &NetworkCreds, interface: Option<NetworkInterface>) -> Result<NetworkCreds> {
+    match (offered, interface) {
+        (NetworkCreds::AlreadyOnNetwork, _) => Ok(NetworkCreds::AlreadyOnNetwork),
+        (NetworkCreds::Any(_), Some(NetworkInterface::Ethernet)) => Ok(NetworkCreds::AlreadyOnNetwork),
+        (NetworkCreds::Any(all), Some(interface)) => all
+            .iter()
+            .find(|creds| NetworkInterface::of(creds) == Some(interface))
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("the device joins {} networks, and no {} credentials were given", interface.name(), interface.name())),
+        (NetworkCreds::Any(all), None) => match all.as_slice() {
+            [only] if NetworkInterface::of(only).is_some() => Ok(only.clone()),
+            _ => Err(anyhow::anyhow!("the device didn't say which kind of network it joins, so it can't be chosen for it")),
+        },
+        (creds, Some(interface)) if NetworkInterface::of(creds) != Some(interface) => Err(anyhow::anyhow!(
+            "the device joins {} networks, not {}",
+            interface.name(),
+            NetworkInterface::of(creds).map_or("this kind", NetworkInterface::name)
+        )),
+        (creds, _) => Ok(creds.clone()),
+    }
+}
+
+/// The status in a command's response fields (tag 0, as General Commissioning's, Network
+/// Commissioning's and AddNOC's responses carry it). A device that turns the command itself down
+/// answers with a status for the command instead of its response, which is an error naming it.
+fn command_status(resp: &messages::Message, command: &str) -> Result<u64> {
+    if let Some(status) = resp.tlv.get_int(&[1, 0, 0, 1, 0]) {
+        return Ok(status);
+    }
+    // An InvokeResponse's CommandStatusIB, or a StatusResponse.
+    let status = if resp.protocol_header.opcode == messages::ProtocolMessageHeader::INTERACTION_OPCODE_STATUS_RESP {
+        resp.tlv.get_int(&[0])
+    } else {
+        resp.tlv.get_int(&[1, 0, 1, 1, 0])
+    };
+    match status {
+        Some(status) if status != 0 => Err(anyhow::anyhow!(
+            "{} turned down: {} (0x{:02x})",
+            command,
+            im_status_name(status),
+            status
+        )),
+        _ => Err(anyhow::anyhow!("{}: status missing", command)),
+    }
+}
+
+/// Interaction Model status codes' names, for errors.
+fn im_status_name(status: u64) -> &'static str {
+    match status {
+        0x00 => "SUCCESS",
+        0x01 => "FAILURE",
+        0x7e => "UNSUPPORTED_ACCESS",
+        0x7f => "UNSUPPORTED_ENDPOINT",
+        0x80 => "INVALID_ACTION",
+        0x81 => "UNSUPPORTED_COMMAND",
+        0x85 => "INVALID_COMMAND",
+        0x86 => "UNSUPPORTED_ATTRIBUTE",
+        0x87 => "CONSTRAINT_ERROR",
+        0x89 => "RESOURCE_EXHAUSTED",
+        0x8b => "NOT_FOUND",
+        0x8d => "INVALID_DATA_TYPE",
+        0x94 => "TIMEOUT",
+        0x9c => "BUSY",
+        0xc3 => "UNSUPPORTED_CLUSTER",
+        0xc6 => "NEEDS_TIMED_INTERACTION",
+        0xca => "FAILSAFE_REQUIRED",
+        0xcb => "INVALID_IN_STATE",
+        _ => "unknown status",
+    }
 }
 
 
@@ -197,11 +317,7 @@ async fn push_device_cert(
     retrcrx.send(&t1).await?;
 
     let resp = retrcrx.get_next_message().await?;
-    let noc_status = {
-        resp.tlv
-            .get_int(&[1, 0, 0, 1, 0])
-            .context("can't get status for AddNOC")?
-    };
+    let noc_status = command_status(&resp, "AddNOC")?;
     if noc_status != 0 {
         return Err(anyhow::anyhow!("AddNOC failed with status {}/{}", noc_status, noc_status_to_str(noc_status)));
     }
@@ -261,11 +377,7 @@ async fn commissioning_complete(
 
     retrctx.send(&t1).await?;
     let resp = retrctx.get_next_message().await?;
-    let comresp_status = {
-        resp.tlv
-            .get_int(&[1, 0, 0, 1, 0])
-            .context("can't get status from CommissioningCompleteResponse")?
-    };
+    let comresp_status = command_status(&resp, "CommissioningComplete")?;
     if comresp_status != 0 {
         return Err(anyhow::anyhow!(
             "CommissioningComplete failed with status {}",
@@ -318,7 +430,7 @@ async fn arm_failsafe(
     )?;
     retrctx.send(&req).await?;
     let resp = retrctx.get_next_message().await?;
-    let status = resp.tlv.get_int(&[1, 0, 0, 1, 0]).context("ArmFailSafe: status missing")?;
+    let status = command_status(&resp, "ArmFailSafe")?;
     if status != 0 {
         return Err(anyhow::anyhow!("ArmFailSafe failed with status {}", status));
     }
@@ -345,7 +457,7 @@ async fn set_regulatory_config(
     )?;
     retrctx.send(&req).await?;
     let resp = retrctx.get_next_message().await?;
-    let status = resp.tlv.get_int(&[1, 0, 0, 1, 0]).context("SetRegulatoryConfig: status missing")?;
+    let status = command_status(&resp, "SetRegulatoryConfig")?;
     if status != 0 {
         return Err(anyhow::anyhow!("SetRegulatoryConfig failed with status {}", status));
     }
@@ -366,6 +478,8 @@ struct CommissioningInfo {
     concurrent_connection: Option<bool>,
     /// Network Commissioning ConnectMaxTimeSeconds: how long joining the network can take.
     connect_max_secs: Option<u8>,
+    /// Network Commissioning's feature map: which kind of network the device joins.
+    network_interface: Option<NetworkInterface>,
 }
 
 #[cfg(feature = "ble")]
@@ -419,6 +533,7 @@ async fn read_commissioning_info(retrctx: &mut retransmit::RetrContext<'_>, exch
     const ATTR_LOCATION_CAPABILITY: u32 = 0x0003;
     const ATTR_SUPPORTS_CONCURRENT_CONNECTION: u32 = 0x0004;
     const ATTR_CONNECT_MAX_TIME_SECONDS: u32 = 0x0003;
+    const ATTR_FEATURE_MAP: u32 = 0xfffc;
     const VALUE: [u8; 4] = [1, 0, 1, 2];
     let mut info = CommissioningInfo::default();
     let reads = [
@@ -426,6 +541,7 @@ async fn read_commissioning_info(retrctx: &mut retransmit::RetrContext<'_>, exch
         (CLUSTER_GENERAL_COMMISSIONING, ATTR_LOCATION_CAPABILITY),
         (CLUSTER_GENERAL_COMMISSIONING, ATTR_SUPPORTS_CONCURRENT_CONNECTION),
         (CLUSTER_NETWORK_COMMISSIONING, ATTR_CONNECT_MAX_TIME_SECONDS),
+        (CLUSTER_NETWORK_COMMISSIONING, ATTR_FEATURE_MAP),
     ];
     for (i, (cluster, attr)) in reads.into_iter().enumerate() {
         let resp = match read_attribute(retrctx, cluster, attr, exchange_id.wrapping_add(i as u16)).await {
@@ -447,7 +563,10 @@ async fn read_commissioning_info(retrctx: &mut retransmit::RetrContext<'_>, exch
                     info.concurrent_connection = Some(*b);
                 }
             }
-            _ => info.connect_max_secs = resp.tlv.get_u8(&VALUE),
+            (CLUSTER_NETWORK_COMMISSIONING, ATTR_CONNECT_MAX_TIME_SECONDS) => {
+                info.connect_max_secs = resp.tlv.get_u8(&VALUE);
+            }
+            _ => info.network_interface = resp.tlv.get_int(&VALUE).and_then(NetworkInterface::from_feature_map),
         }
     }
     info
@@ -474,7 +593,7 @@ async fn add_or_update_wifi(
     )?;
     retrctx.send(&req).await?;
     let resp = retrctx.get_next_message().await?;
-    let status = resp.tlv.get_int(&[1, 0, 0, 1, 0]).context("AddOrUpdateWifiNetwork: status missing")?;
+    let status = command_status(&resp, "AddOrUpdateWifiNetwork")?;
     if status != 0 {
         return Err(anyhow::anyhow!("AddOrUpdateWifiNetwork failed with status {}", status));
     }
@@ -518,7 +637,7 @@ async fn add_or_update_thread(
     )?;
     retrctx.send(&req).await?;
     let resp = retrctx.get_next_message().await?;
-    let status = resp.tlv.get_int(&[1, 0, 0, 1, 0]).context("AddOrUpdateThreadNetwork: status missing")?;
+    let status = command_status(&resp, "AddOrUpdateThreadNetwork")?;
     if status != 0 {
         return Err(anyhow::anyhow!("AddOrUpdateThreadNetwork failed with status {}", status));
     }
@@ -583,7 +702,7 @@ async fn connect_network(
             return Ok(());
         }
     };
-    let status = resp.tlv.get_int(&[1, 0, 0, 1, 0]).context("ConnectNetwork: status missing")?;
+    let status = command_status(&resp, "ConnectNetwork")?;
     if status != 0 {
         return Err(anyhow::anyhow!("ConnectNetwork failed: {} ({})", networking_status(status), status));
     }
@@ -612,13 +731,18 @@ pub(crate) async fn commission_ble_phase(
     let e_net1     = base.wrapping_add(8);
     let e_net2     = base.wrapping_add(9);
     let e_arm2     = base.wrapping_add(10);
-    let e_info     = base.wrapping_add(11); // four reads: 11..=14
+    let e_info     = base.wrapping_add(11); // five reads: 11..=15
 
     arm_failsafe(&mut retrctx, 60, e_arm).await.context("ArmFailSafe")?;
     log::debug!("Failsafe armed for 60 seconds");
 
     let info = read_commissioning_info(&mut retrctx, e_info).await;
     log::info!("Commissionee: {:?}", info);
+    // Chosen before the device is given anything, so one that can't join is left as it was.
+    let network_creds = credentials_for(network_creds, info.network_interface)?;
+    if let Some(interface) = NetworkInterface::of(&network_creds) {
+        log::info!("Giving the device {} credentials", interface.name());
+    }
     // matc paired devices without this before; one that turns it down still gets commissioned.
     match set_regulatory_config(&mut retrctx, info.regulatory_location(), e_reg).await {
         Ok(()) => log::debug!("Regulatory configuration set"),
@@ -635,7 +759,7 @@ pub(crate) async fn commission_ble_phase(
     push_device_cert(&mut retrctx, cm, csrd, node_id, controller_id, fabric, e_noc).await?;
     log::debug!("Device certificate pushed");
 
-    match network_creds {
+    match &network_creds {
         NetworkCreds::WiFi { ssid, creds } => {
             let net_id = add_or_update_wifi(&mut retrctx, ssid, creds, e_net1).await?;
             rearm_for_network(&mut retrctx, &info, e_arm2).await?;
@@ -651,7 +775,8 @@ pub(crate) async fn commission_ble_phase(
             log::debug!("Thread network connected");
             //tokio::time::sleep(std::time::Duration::from_secs(5)).await;
         }
-        NetworkCreds::AlreadyOnNetwork => {}
+        // credentials_for never gives back Any.
+        NetworkCreds::AlreadyOnNetwork | NetworkCreds::Any(_) => {}
     }
 
     Ok(())
@@ -714,5 +839,107 @@ mod network_step_tests {
         assert_eq!(networking_status(5), "NetworkNotFound");
         assert_eq!(networking_status(7), "AuthFailure");
         assert_eq!(networking_status(200), "UnknownError");
+    }
+
+    #[test]
+    fn test_interface_from_feature_map() {
+        assert_eq!(NetworkInterface::from_feature_map(0b001), Some(NetworkInterface::WiFi));
+        assert_eq!(NetworkInterface::from_feature_map(0b010), Some(NetworkInterface::Thread));
+        assert_eq!(NetworkInterface::from_feature_map(0b100), Some(NetworkInterface::Ethernet));
+        // Feature bits past the interface's don't matter; none, or more than one, says nothing.
+        assert_eq!(NetworkInterface::from_feature_map(0b1010), Some(NetworkInterface::Thread));
+        assert_eq!(NetworkInterface::from_feature_map(0), None);
+        assert_eq!(NetworkInterface::from_feature_map(0b011), None);
+    }
+
+    #[test]
+    fn test_credentials_follow_the_device() {
+        let wifi = NetworkCreds::WiFi { ssid: b"IOT.NET".to_vec(), creds: b"secret".to_vec() };
+        let thread = NetworkCreds::Thread { dataset: vec![0x0e, 0x08] };
+        let kind = |creds: Result<NetworkCreds>| creds.map(|c| NetworkInterface::of(&c)).map_err(|e| e.to_string());
+        let any = NetworkCreds::Any(vec![thread.clone(), wifi.clone()]);
+
+        assert_eq!(kind(credentials_for(&any, Some(NetworkInterface::WiFi))), Ok(Some(NetworkInterface::WiFi)));
+        assert_eq!(kind(credentials_for(&any, Some(NetworkInterface::Thread))), Ok(Some(NetworkInterface::Thread)));
+        assert!(matches!(credentials_for(&any, Some(NetworkInterface::Ethernet)), Ok(NetworkCreds::AlreadyOnNetwork)));
+        assert_eq!(
+            kind(credentials_for(&NetworkCreds::Any(vec![thread.clone()]), Some(NetworkInterface::WiFi))),
+            Err("the device joins Wi-Fi networks, and no Wi-Fi credentials were given".to_string())
+        );
+        // A device that doesn't say gets the only kind there is, and can't be guessed between two.
+        assert_eq!(kind(credentials_for(&NetworkCreds::Any(vec![wifi.clone()]), None)), Ok(Some(NetworkInterface::WiFi)));
+        assert!(credentials_for(&any, None).is_err());
+
+        // Credentials of one kind go only to a device of that kind, or one that doesn't say.
+        assert_eq!(
+            kind(credentials_for(&thread, Some(NetworkInterface::WiFi))),
+            Err("the device joins Wi-Fi networks, not Thread".to_string())
+        );
+        assert_eq!(kind(credentials_for(&thread, Some(NetworkInterface::Thread))), Ok(Some(NetworkInterface::Thread)));
+        assert_eq!(kind(credentials_for(&wifi, None)), Ok(Some(NetworkInterface::WiFi)));
+        assert!(matches!(credentials_for(&NetworkCreds::AlreadyOnNetwork, Some(NetworkInterface::WiFi)), Ok(NetworkCreds::AlreadyOnNetwork)));
+    }
+
+    /// An InvokeResponse with `fields_status` in the command's response fields, or else
+    /// `command_status` for the whole command.
+    fn invoke_response(fields_status: Option<u8>, command_status: Option<u8>) -> messages::Message {
+        let mut b = tlv::TlvBuffer::new();
+        b.write_anon_struct().unwrap();
+        b.write_bool(0, false).unwrap();
+        b.write_array(1).unwrap();
+        b.write_anon_struct().unwrap();
+        let (tag, status) = match (fields_status, command_status) {
+            (Some(status), _) => (0, status),
+            (None, Some(status)) => (1, status),
+            (None, None) => (0, 0),
+        };
+        b.write_struct(tag).unwrap();
+        b.write_list(0).unwrap();
+        b.write_uint16(0, 0).unwrap();
+        b.write_uint32(1, CLUSTER_NETWORK_COMMISSIONING).unwrap();
+        b.write_uint32(2, CMD_NETWORK_ADD_OR_UPDATE_THREAD).unwrap();
+        b.write_struct_end().unwrap();
+        b.write_struct(1).unwrap();
+        if fields_status.is_some() || command_status.is_some() {
+            b.write_uint8(0, status).unwrap();
+        }
+        b.write_struct_end().unwrap();
+        b.write_struct_end().unwrap();
+        b.write_struct_end().unwrap();
+        b.write_struct_end().unwrap();
+        b.write_struct_end().unwrap();
+        messages::Message {
+            message_header: messages::MessageHeader {
+                flags: 0,
+                security_flags: 0,
+                session_id: 0,
+                message_counter: 0,
+                source_node_id: None,
+                destination_node_id: None,
+            },
+            protocol_header: messages::ProtocolMessageHeader {
+                exchange_flags: 0,
+                opcode: messages::ProtocolMessageHeader::INTERACTION_OPCODE_INVOKE_RESP,
+                exchange_id: 0,
+                protocol_id: messages::ProtocolMessageHeader::PROTOCOL_ID_INTERACTION,
+                ack_counter: 0,
+            },
+            payload: Vec::new(),
+            tlv: tlv::decode_tlv(&b.data).unwrap(),
+            status_report_info: None,
+        }
+    }
+
+    #[test]
+    fn test_command_status() {
+        let status = |resp: messages::Message| command_status(&resp, "AddOrUpdateThreadNetwork").map_err(|e| e.to_string());
+        assert_eq!(status(invoke_response(Some(0), None)), Ok(0));
+        assert_eq!(status(invoke_response(Some(5), None)), Ok(5));
+        // A command the device doesn't have, as AddOrUpdateThreadNetwork is on a Wi-Fi device.
+        assert_eq!(
+            status(invoke_response(None, Some(0x81))),
+            Err("AddOrUpdateThreadNetwork turned down: UNSUPPORTED_COMMAND (0x81)".to_string())
+        );
+        assert_eq!(status(invoke_response(None, None)), Err("AddOrUpdateThreadNetwork: status missing".to_string()));
     }
 }
